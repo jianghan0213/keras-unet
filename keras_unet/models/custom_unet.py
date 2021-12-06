@@ -126,6 +126,77 @@ def conv2d_block(
     return c
 
 
+def res_conv_block(
+    inputs,
+    use_batch_norm=True,
+    dropout=0.3,
+    dropout_type="spatial",
+    filters=16,
+    kernel_size=(3, 3),
+    activation="relu",
+    kernel_initializer="he_normal",
+    padding="same",
+):
+    '''
+    Residual convolutional layer.
+    Two variants....
+    Either put activation function before the addition with shortcut
+    or after the addition (which would be as proposed in the original resNet).
+
+    1. conv - BN - Activation - conv - BN - Activation
+                                          - shortcut  - BN - shortcut+BN
+
+    2. conv - BN - Activation - conv - BN
+                                     - shortcut  - BN - shortcut+BN - Activation
+
+    Check fig 4 in https://arxiv.org/ftp/arxiv/papers/1802/1802.06955.pdf
+    '''
+
+    if dropout_type == "spatial":
+        DO = SpatialDropout2D
+    elif dropout_type == "standard":
+        DO = Dropout
+    else:
+        raise ValueError(
+            f"dropout_type must be one of ['spatial', 'standard'], got {dropout_type}"
+        )
+
+    c = Conv2D(
+        filters,
+        kernel_size,
+        activation=activation,
+        kernel_initializer=kernel_initializer,
+        padding=padding,
+        use_bias=not use_batch_norm,
+    )(inputs)
+    if use_batch_norm:
+        c = BatchNormalization()(c)
+    if dropout > 0.0:
+        c = DO(dropout)(c)
+    # c = Conv2D(
+    #     filters,
+    #     kernel_size,
+    #     activation=activation,
+    #     kernel_initializer=kernel_initializer,
+    #     padding=padding,
+    #     use_bias=not use_batch_norm,
+    # )(c)
+    c = Conv2D(filters, kernel_size, padding=padding, kernel_initializer=kernel_initializer)(c)
+    if not use_batch_norm:
+        c = BatchNormalization(axis=3)(c)
+    # conv = layers.Activation('relu')(conv)    #Activation before addition with shortcut
+    if dropout > 0:
+        c = DO(dropout)(c)
+
+    shortcut = Conv2D(filters, kernel_size, padding=padding)(inputs)
+    if not use_batch_norm:
+        shortcut = BatchNormalization(axis=3)(shortcut)
+
+    res_path = add([shortcut, c])
+    res_path = Activation(activation)(res_path)  # Activation after addition with shortcut (Original residual block)
+    return res_path
+
+
 def custom_unet(
     input_shape,
     num_classes=1,
@@ -240,6 +311,82 @@ def custom_unet(
         )
 
     outputs = Conv2D(num_classes, (1, 1), activation=output_activation)(x)
+    # add a maxpooling layer
+    # outputs = MaxPooling2D((2, 2))(outputs)
+    model = Model(inputs=[inputs], outputs=[outputs])
+    return model
 
+def attention_ResUNet(
+    input_shape,
+    num_classes=1,
+    activation="relu",
+    use_batch_norm=True,
+    upsample_mode="deconv",  # 'deconv' or 'simple'
+    dropout=0.3,
+    dropout_change_per_layer=0.0,
+    dropout_type="spatial",
+    use_dropout_on_upsampling=False,
+    use_attention=False,
+    filters=16,
+    num_layers=4,
+    output_activation="sigmoid",
+):  # 'sigmoid' or 'softmax'
+    if upsample_mode == "deconv":
+        upsample = upsample_conv
+    else:
+        upsample = upsample_simple
+
+    # Build U-Net model
+    inputs = Input(input_shape)
+    x = inputs
+
+    down_layers = []
+    for l in range(num_layers):
+        x = res_conv_block(
+            inputs=x,
+            filters=filters,
+            use_batch_norm=use_batch_norm,
+            dropout=dropout,
+            dropout_type=dropout_type,
+            activation=activation,
+        )
+        down_layers.append(x)
+        x = MaxPooling2D((2, 2))(x)
+        dropout += dropout_change_per_layer
+        filters = filters * 2  # double the number of filters with each layer
+
+    x = res_conv_block(
+        inputs=x,
+        filters=filters,
+        use_batch_norm=use_batch_norm,
+        dropout=dropout,
+        dropout_type=dropout_type,
+        activation=activation,
+    )
+
+    if not use_dropout_on_upsampling:
+        dropout = 0.0
+        dropout_change_per_layer = 0.0
+
+    for conv in reversed(down_layers):
+        filters //= 2  # decreasing number of filters with each layer
+        dropout -= dropout_change_per_layer
+        x = upsample(filters, (2, 2), strides=(2, 2), padding="same")(x)
+        if use_attention:
+            x = attention_concat(conv_below=x, skip_connection=conv)
+        else:
+            x = concatenate([x, conv])
+        x = res_conv_block(
+            inputs=x,
+            filters=filters,
+            use_batch_norm=use_batch_norm,
+            dropout=dropout,
+            dropout_type=dropout_type,
+            activation=activation,
+        )
+
+    outputs = Conv2D(num_classes, (1, 1), activation=output_activation)(x)
+    # add a maxpooling layer
+    # outputs = MaxPooling2D((2, 2))(outputs)
     model = Model(inputs=[inputs], outputs=[outputs])
     return model
